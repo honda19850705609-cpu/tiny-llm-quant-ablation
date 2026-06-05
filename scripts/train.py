@@ -7,10 +7,12 @@ accumulation so it fits on an L4.
 
 Typical Colab run:
     from google.colab import drive; drive.mount('/content/drive')
-    !python -m scripts.train \
-        --data_dir data \
-        --ckpt_dir /content/drive/MyDrive/tiny-llm-ckpt \
-        --max_iters 20000
+    %cd /content/drive/MyDrive/AI_learning/tiny-llm-quant-ablation/github
+    !python -m scripts.train --max_iters 20000
+
+Defaults point at Drive paths under the project root:
+    /content/drive/MyDrive/AI_learning/tiny-llm-quant-ablation/tllm-data
+    /content/drive/MyDrive/AI_learning/tiny-llm-quant-ablation/ckpt
 
 Resume is automatic: re-run the same command after a disconnect.
 """
@@ -25,6 +27,10 @@ import numpy as np
 import torch
 
 from tllm.model import TinyLLM, ModelConfig
+
+PROJECT_ROOT = "/content/drive/MyDrive/AI_learning/tiny-llm-quant-ablation"
+DEFAULT_DATA_DIR = os.path.join(PROJECT_ROOT, "tllm-data")
+DEFAULT_CKPT_DIR = os.path.join(PROJECT_ROOT, "ckpt")
 
 
 def get_batch(data, block_size, batch_size, device):
@@ -57,8 +63,8 @@ def lr_lambda(it, warmup, max_iters, min_ratio=0.1):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="data")
-    ap.add_argument("--ckpt_dir", default="ckpt")
+    ap.add_argument("--data_dir", default=DEFAULT_DATA_DIR)
+    ap.add_argument("--ckpt_dir", default=DEFAULT_CKPT_DIR)
     ap.add_argument("--max_iters", type=int, default=20000)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--grad_accum", type=int, default=2)
@@ -78,6 +84,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
     print(f"device={device} dtype={dtype}")
+    print(f"data_dir={args.data_dir}")
+    print(f"ckpt_dir={args.ckpt_dir}")
 
     train_data = np.memmap(os.path.join(args.data_dir, "train.bin"), dtype=np.uint16, mode="r")
     val_data = np.memmap(os.path.join(args.data_dir, "val.bin"), dtype=np.uint16, mode="r")
