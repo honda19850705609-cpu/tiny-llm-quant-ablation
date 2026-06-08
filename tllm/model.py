@@ -34,6 +34,10 @@ class ModelConfig:
     n_experts: int = 8            # total experts in each MoE layer
     n_experts_per_tok: int = 2    # top-k experts actually run per token
     moe_aux_loss_coef: float = 0.01   # load-balancing loss weight (training only)
+    router_z_loss_coef: float = 0.0   # MoE router z-loss (0 = off); calms routing logits
+    # --- stability / quality knobs (all off by default -> dense baseline unchanged) ---
+    use_qk_norm: bool = False         # RMSNorm on per-head Q and K before attention
+    logit_softcap: float = 0.0        # tanh soft-cap on final logits (0 = off), Gemma2-style
 
     def __post_init__(self):
         if self.ffn_hidden is None:
@@ -100,6 +104,10 @@ class Attention(nn.Module):
         self.wv = nn.Linear(cfg.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.wo = nn.Linear(self.n_head * self.head_dim, cfg.n_embd, bias=False)
         self.dropout = cfg.dropout
+        self.use_qk_norm = cfg.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
     def forward(self, x, cos, sin, kv_cache=None):
         B, T, _ = x.shape
@@ -107,6 +115,9 @@ class Attention(nn.Module):
         k = self.wk(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.wv(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
@@ -172,6 +183,7 @@ class MoE(nn.Module):
         self.n_experts = cfg.n_experts
         self.top_k = cfg.n_experts_per_tok
         self.aux_coef = cfg.moe_aux_loss_coef
+        self.z_coef = cfg.router_z_loss_coef
         # router: one logit per expert, per token
         self.gate = nn.Linear(cfg.n_embd, cfg.n_experts, bias=False)
         # each expert is just a standard SwiGLU FFN
@@ -214,6 +226,12 @@ class MoE(nn.Module):
             f = counts / flat_idx.numel()
         P = router_probs.mean(dim=0)                   # (n_experts,)
         aux_loss = self.aux_coef * self.n_experts * (f * P).sum()
+
+        # router z-loss: penalize large router logits so the gating stays
+        # numerically calm and no single logit runs away (ST-MoE).
+        if self.z_coef > 0:
+            z = torch.logsumexp(router_logits, dim=-1)   # (N,)
+            aux_loss = aux_loss + self.z_coef * (z ** 2).mean()
 
         return out.reshape(B, T, C), aux_loss
 
@@ -284,7 +302,7 @@ class TinyLLM(nn.Module):
             if aux is not None:
                 aux_total = aux if aux_total is None else aux_total + aux
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = self._softcap(self.lm_head(x))
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
@@ -316,7 +334,7 @@ class TinyLLM(nn.Module):
         for i, block in enumerate(self.blocks):
             x, caches[i], _ = block(x, pos_cos, pos_sin, kv_cache=(None, None))
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = self._softcap(self.lm_head(x))
         idx = self._sample(idx, logits, temperature, top_k)
 
         for step in range(max_new_tokens - 1):
@@ -327,9 +345,15 @@ class TinyLLM(nn.Module):
             for i, block in enumerate(self.blocks):
                 x, caches[i], _ = block(x, pos_cos, pos_sin, kv_cache=caches[i])
             x = self.norm(x)
-            logits = self.lm_head(x)
+            logits = self._softcap(self.lm_head(x))
             idx = self._sample(idx, logits, temperature, top_k)
         return idx
+
+    def _softcap(self, logits):
+        c = self.cfg.logit_softcap
+        if c and c > 0:
+            logits = c * torch.tanh(logits / c)
+        return logits
 
     @staticmethod
     def _sample(idx, logits, temperature, top_k):

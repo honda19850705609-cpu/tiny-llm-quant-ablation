@@ -86,6 +86,11 @@ def main():
     ap.add_argument("--ffn_hidden", type=int, default=None,
                     help="override FFN/expert hidden dim; use to match MoE active "
                          "params to the dense baseline (iso-active ablation)")
+    # stability / quality knobs
+    ap.add_argument("--router_z_loss_coef", type=float, default=0.0)
+    ap.add_argument("--use_qk_norm", action="store_true")
+    ap.add_argument("--logit_softcap", type=float, default=0.0)
+    ap.add_argument("--dropout", type=float, default=0.0)
     args = ap.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -109,9 +114,11 @@ def main():
     cfg = ModelConfig(
         vocab_size=vocab_size, n_layer=args.n_layer, n_head=args.n_head,
         n_kv_head=args.n_kv_head, n_embd=args.n_embd, block_size=args.block_size,
-        ffn_hidden=args.ffn_hidden,
+        ffn_hidden=args.ffn_hidden, dropout=args.dropout,
         use_moe=args.use_moe, n_experts=args.n_experts,
         n_experts_per_tok=args.n_experts_per_tok, moe_aux_loss_coef=args.moe_aux_loss_coef,
+        router_z_loss_coef=args.router_z_loss_coef, use_qk_norm=args.use_qk_norm,
+        logit_softcap=args.logit_softcap,
     )
     model = TinyLLM(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
