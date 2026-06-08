@@ -28,6 +28,12 @@ class ModelConfig:
     dropout: float = 0.0
     # SwiGLU hidden dim uses the 2/3 * 4 * n_embd rule, rounded to multiple of 64
     ffn_hidden: int = None
+    # --- MoE (mixture-of-experts) FFN. Off by default, so dense runs are byte-
+    # for-byte unchanged and the dense-vs-MoE ablation is clean. ---
+    use_moe: bool = False
+    n_experts: int = 8            # total experts in each MoE layer
+    n_experts_per_tok: int = 2    # top-k experts actually run per token
+    moe_aux_loss_coef: float = 0.01   # load-balancing loss weight (training only)
 
     def __post_init__(self):
         if self.ffn_hidden is None:
@@ -143,6 +149,76 @@ class SwiGLU(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Mixture-of-Experts FFN (Mixtral / Switch style)
+# ---------------------------------------------------------------------------
+class MoE(nn.Module):
+    """Sparse MoE FFN: replace one SwiGLU with `n_experts` of them, plus a router
+    that sends each token to only its top-k experts.
+
+    Why this matters: total parameters (capacity) scale with n_experts, but the
+    compute per token stays at ~top_k experts. That decoupling of *capacity* from
+    *compute* is the whole point of MoE, and it's exactly what the dense-vs-MoE
+    ablation measures.
+
+    forward() returns (output, aux_loss):
+      - output: same shape as input, the top-k weighted expert mix.
+      - aux_loss: load-balancing loss (Switch Transformer eq. 4). Without it the
+        router collapses onto a few experts and the rest go dead. Add it to the
+        training loss; it is a no-op at eval (we just don't use it there).
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.n_experts = cfg.n_experts
+        self.top_k = cfg.n_experts_per_tok
+        self.aux_coef = cfg.moe_aux_loss_coef
+        # router: one logit per expert, per token
+        self.gate = nn.Linear(cfg.n_embd, cfg.n_experts, bias=False)
+        # each expert is just a standard SwiGLU FFN
+        self.experts = nn.ModuleList([SwiGLU(cfg) for _ in range(cfg.n_experts)])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.reshape(-1, C)                       # (N, C),  N = B*T
+        N = x_flat.shape[0]
+
+        router_logits = self.gate(x_flat)              # (N, n_experts)
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        # pick top-k experts per token and renormalize their gate weights to sum 1
+        topk_w, topk_idx = torch.topk(router_probs, self.top_k, dim=-1)   # (N, k)
+        topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+
+        # flatten the (token, slot) assignments so we can group by expert
+        flat_idx = topk_idx.reshape(-1)                # (N*k,)  which expert
+        flat_w = topk_w.reshape(-1)                    # (N*k,)  its weight
+        token_ids = torch.arange(N, device=x.device).repeat_interleave(self.top_k)
+
+        # dispatch: run each expert once on the tokens routed to it, scatter back
+        out = torch.zeros_like(x_flat)
+        for e in range(self.n_experts):
+            sel = flat_idx == e
+            if not sel.any():
+                continue
+            tok = token_ids[sel]                       # tokens going to expert e
+            w = flat_w[sel].unsqueeze(-1)              # their gate weights
+            out.index_add_(0, tok, self.experts[e](x_flat[tok]) * w)
+
+        # ---- load-balancing aux loss: n * sum_i f_i * P_i ----
+        # f_i = fraction of assignments dispatched to expert i (counted, no grad)
+        # P_i = mean router probability for expert i (differentiable)
+        # balanced -> f_i = P_i = 1/n -> loss = aux_coef; imbalance pushes it up.
+        with torch.no_grad():
+            counts = torch.zeros(self.n_experts, device=x.device)
+            counts.scatter_add_(0, flat_idx, torch.ones_like(flat_w))
+            f = counts / flat_idx.numel()
+        P = router_probs.mean(dim=0)                   # (n_experts,)
+        aux_loss = self.aux_coef * self.n_experts * (f * P).sum()
+
+        return out.reshape(B, T, C), aux_loss
+
+
+# ---------------------------------------------------------------------------
 # Block + full model
 # ---------------------------------------------------------------------------
 class Block(nn.Module):
@@ -151,13 +227,18 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(cfg.n_embd)
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.n_embd)
-        self.ffn = SwiGLU(cfg)
+        self.use_moe = cfg.use_moe
+        self.ffn = MoE(cfg) if cfg.use_moe else SwiGLU(cfg)
 
     def forward(self, x, cos, sin, kv_cache=None):
         h, new_cache = self.attn(self.attn_norm(x), cos, sin, kv_cache)
         x = x + h
-        x = x + self.ffn(self.ffn_norm(x))
-        return x, new_cache
+        if self.use_moe:
+            ffn_out, aux = self.ffn(self.ffn_norm(x))
+        else:
+            ffn_out, aux = self.ffn(self.ffn_norm(x)), None
+        x = x + ffn_out
+        return x, new_cache, aux
 
 
 class TinyLLM(nn.Module):
@@ -178,7 +259,13 @@ class TinyLLM(nn.Module):
 
         self.apply(self._init_weights)
         n_params = sum(p.numel() for p in self.parameters()) - self.lm_head.weight.numel()
-        print(f"[TinyLLM] non-embedding params: {n_params/1e6:.2f}M")
+        print(f"[TinyLLM] total non-embedding params: {n_params/1e6:.2f}M")
+        if cfg.use_moe:
+            # only top_k of n_experts run per token, so "active" params < total
+            expert_params = sum(p.numel() for b in self.blocks for p in b.ffn.experts.parameters())
+            inactive = expert_params * (cfg.n_experts - cfg.n_experts_per_tok) / cfg.n_experts
+            print(f"[TinyLLM] active params/token: {(n_params - inactive)/1e6:.2f}M  "
+                  f"({cfg.n_experts} experts, top-{cfg.n_experts_per_tok})")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -191,8 +278,11 @@ class TinyLLM(nn.Module):
         x = self.tok_emb(idx)
         cos = self.rope_cos.to(x.device)
         sin = self.rope_sin.to(x.device)
+        aux_total = None
         for block in self.blocks:
-            x, _ = block(x, cos, sin)
+            x, _, aux = block(x, cos, sin)
+            if aux is not None:
+                aux_total = aux if aux_total is None else aux_total + aux
         x = self.norm(x)
         logits = self.lm_head(x)
         loss = None
@@ -202,6 +292,8 @@ class TinyLLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-1,
             )
+            if aux_total is not None:
+                loss = loss + aux_total
         return logits, loss
 
     @torch.no_grad()
@@ -222,7 +314,7 @@ class TinyLLM(nn.Module):
         x = self.tok_emb(idx)
         pos_cos, pos_sin = cos[:idx.size(1)], sin[:idx.size(1)]
         for i, block in enumerate(self.blocks):
-            x, caches[i] = block(x, pos_cos, pos_sin, kv_cache=(None, None))
+            x, caches[i], _ = block(x, pos_cos, pos_sin, kv_cache=(None, None))
         x = self.norm(x)
         logits = self.lm_head(x)
         idx = self._sample(idx, logits, temperature, top_k)
@@ -233,7 +325,7 @@ class TinyLLM(nn.Module):
             t = idx.size(1) - 1
             pos_cos, pos_sin = cos[t:t + 1], sin[t:t + 1]
             for i, block in enumerate(self.blocks):
-                x, caches[i] = block(x, pos_cos, pos_sin, kv_cache=caches[i])
+                x, caches[i], _ = block(x, pos_cos, pos_sin, kv_cache=caches[i])
             x = self.norm(x)
             logits = self.lm_head(x)
             idx = self._sample(idx, logits, temperature, top_k)

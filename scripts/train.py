@@ -78,6 +78,14 @@ def main():
     ap.add_argument("--n_kv_head", type=int, default=4)
     ap.add_argument("--n_embd", type=int, default=512)
     ap.add_argument("--block_size", type=int, default=512)
+    # MoE knobs (default off -> dense SwiGLU, unchanged)
+    ap.add_argument("--use_moe", action="store_true", help="use mixture-of-experts FFN")
+    ap.add_argument("--n_experts", type=int, default=8)
+    ap.add_argument("--n_experts_per_tok", type=int, default=2)
+    ap.add_argument("--moe_aux_loss_coef", type=float, default=0.01)
+    ap.add_argument("--ffn_hidden", type=int, default=None,
+                    help="override FFN/expert hidden dim; use to match MoE active "
+                         "params to the dense baseline (iso-active ablation)")
     args = ap.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -101,6 +109,9 @@ def main():
     cfg = ModelConfig(
         vocab_size=vocab_size, n_layer=args.n_layer, n_head=args.n_head,
         n_kv_head=args.n_kv_head, n_embd=args.n_embd, block_size=args.block_size,
+        ffn_hidden=args.ffn_hidden,
+        use_moe=args.use_moe, n_experts=args.n_experts,
+        n_experts_per_tok=args.n_experts_per_tok, moe_aux_loss_coef=args.moe_aux_loss_coef,
     )
     model = TinyLLM(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)

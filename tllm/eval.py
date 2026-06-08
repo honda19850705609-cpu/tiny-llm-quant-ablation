@@ -23,8 +23,11 @@ import torch
 
 
 @torch.no_grad()
-def perplexity(model, data, block_size, device, n_batches=100, batch_size=16):
+def perplexity(model, data, block_size, device, n_batches=100, batch_size=16, seed=1234):
     model.eval()
+    # fix the sampling RNG so every config sees the SAME eval windows -> the
+    # tiny ppl gaps between configs are signal, not sampling noise.
+    torch.manual_seed(seed)
     nll, count = 0.0, 0
     for _ in range(n_batches):
         ix = torch.randint(len(data) - block_size - 1, (batch_size,))
@@ -40,9 +43,10 @@ def perplexity(model, data, block_size, device, n_batches=100, batch_size=16):
 
 
 @torch.no_grad()
-def perplexity_by_position(model, data, block_size, device, n_batches=200, batch_size=16, n_buckets=8):
+def perplexity_by_position(model, data, block_size, device, n_batches=200, batch_size=16, n_buckets=8, seed=1234):
     """Return list of (bucket_start, bucket_end, ppl) over context positions."""
     model.eval()
+    torch.manual_seed(seed)   # same windows across configs (see perplexity())
     bucket_nll = np.zeros(n_buckets)
     bucket_cnt = np.zeros(n_buckets)
     bsz = block_size // n_buckets
