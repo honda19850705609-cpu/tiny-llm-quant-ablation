@@ -118,7 +118,13 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.n_rep, dim=1)
             v = v.repeat_interleave(self.n_rep, dim=1)
 
-        is_causal = kv_cache is None  # during cached generation we attend to all past
+        # Causal whenever we process >1 query token at once (training OR the
+        # prefill pass of cached generation). A single-token decode step
+        # (q_len == 1) attends to all cached past, for which a causal mask is a
+        # no-op. The previous `kv_cache is None` made prefill NON-causal —
+        # kv_cache=(None, None) is truthy — so multi-token prompts attended
+        # bidirectionally and the first generated token was wrong.
+        is_causal = q.size(2) > 1
         y = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0,

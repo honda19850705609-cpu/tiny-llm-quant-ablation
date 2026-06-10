@@ -94,3 +94,88 @@ def model_size_bits(model, weight_bits=16):
         bits = weight_bits if "weight" in n else 16
         total += p.numel() * bits
     return total / 8 / 1e6  # MB
+
+
+# ---------------------------------------------------------------------------
+# TASK metrics — does the model get the answer RIGHT? (not just "how surprised")
+#
+# Perplexity measures fluency; these measure task completion. They drive the
+# Phase 1/2 experiments (algorithmic tasks, long-range retrieval) where the
+# question is "can a *compressed* model still DO the task", and where the
+# KV-cache ablation can finally show a long-range tax.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _greedy_answers(model, prompts, answer_len, device):
+    """Greedy-decode `answer_len` tokens for a batch of equal-length prompts.
+    prompts: int64 tensor (B, P). Returns generated tokens (B, answer_len)."""
+    model.eval()
+    idx = prompts.to(device)
+    P = idx.size(1)
+    # top_k=1 + temperature=1 == argmax == greedy, so the metric is deterministic
+    out = model.generate(idx, max_new_tokens=answer_len, temperature=1.0,
+                         top_k=1, use_cache=True)
+    return out[:, P:P + answer_len]
+
+
+@torch.no_grad()
+def task_accuracy(model, task, device, n_samples=512, batch_size=64, seed=1234):
+    """Fraction of samples whose greedily-decoded answer exactly matches.
+
+    Returns (accuracy, n_evaluated). Exact-match per sample by default (a task
+    may override Task.score, but accuracy here uses full-answer equality which
+    is the strict, honest metric for these deterministic tasks).
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    answer_len = task.answer_len
+    correct, total = 0, 0
+    while total < n_samples:
+        bs = min(batch_size, n_samples - total)
+        samples = [task.sample(rng) for _ in range(bs)]
+        prompts = torch.tensor([s.prompt_ids for s in samples], dtype=torch.long)
+        gen = _greedy_answers(model, prompts, answer_len, device).cpu().tolist()
+        for s, pred in zip(samples, gen):
+            correct += int(task.score(pred, s.answer_ids))
+            total += 1
+    return correct / total, total
+
+
+@torch.no_grad()
+def accuracy_by_distance(model, task, device, distances, n_per_dist=128,
+                         batch_size=64, seed=1234):
+    """The long-range scalpel: accuracy bucketed by retrieval distance.
+
+    `task` must accept a distance control in sample() — KeyValueTask(query_pos)
+    or InductionTask(gap). For each requested distance we generate fresh samples
+    pinned to that distance and measure exact-match accuracy. This is the
+    accuracy analogue of perplexity_by_position, and it is what would reveal a
+    KV-cache INT4 long-range tax if one exists.
+
+    Returns list of (distance, accuracy).
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    answer_len = task.answer_len
+
+    # how to pin a sample to a target distance, per task
+    def make_sample(dist):
+        if hasattr(task, "n_pairs"):                       # KeyValueTask
+            query_pos = task.n_pairs - 1 - dist
+            return task.sample(rng, query_pos=query_pos)
+        if task.name == "induction":
+            return task.sample(rng, gap=dist)
+        raise ValueError(f"task {task.name} has no distance control")
+
+    out = []
+    for dist in distances:
+        correct, total = 0, 0
+        while total < n_per_dist:
+            bs = min(batch_size, n_per_dist - total)
+            samples = [make_sample(dist) for _ in range(bs)]
+            prompts = torch.tensor([s.prompt_ids for s in samples], dtype=torch.long)
+            gen = _greedy_answers(model, prompts, answer_len, device).cpu().tolist()
+            for s, pred in zip(samples, gen):
+                correct += int(task.score(pred, s.answer_ids))
+                total += 1
+        out.append((int(dist), correct / total))
+    return out
