@@ -157,12 +157,85 @@ connected`), which will kill a long run mid-way.
 tllm/
   model.py     # RoPE / RMSNorm / SwiGLU / GQA / KV-cache transformer
   quant.py     # weight + KV-cache quantization
-  eval.py      # perplexity, per-position perplexity, latency/memory
+  eval.py      # perplexity, per-position perplexity, latency/memory,
+               #   task accuracy, accuracy-by-distance   (new)
+  tasks.py     # synthetic task framework, checkable answers          (new)
+               #   tier 1: copy/reverse/sort/kv/induction/multitask
+               #   tier 2: addition/incontext/multihop/statetrack/tooluse
+  sft.py       # instruction chat-template + response-only loss mask  (new)
 scripts/
-  prepare_data.py   # TinyStories -> tokenizer -> memmap
-  train.py          # training loop w/ checkpointing + resume
-  run_ablation.py   # the experiment grid -> results.json + plot
+  prepare_data.py      # TinyStories -> tokenizer -> memmap
+  train.py             # LM training loop w/ checkpointing + resume
+  run_ablation.py      # perplexity ablation grid -> results.json + plot
+  train_task.py        # train a fresh model on a synthetic task        (new)
+  run_task_ablation.py # quant grid on a task model -> accuracy-by-distance (new)
+  prepare_sft.py       # build an SFT dataset (Alpaca-style)            (new)
+  train_sft.py         # instruction-tune the pretrained LM            (new)
+  chat.py              # chat with the SFT'd model                     (new)
 ```
+
+## Beyond perplexity: task completion + the long-range re-run
+
+Perplexity tells you how *surprised* a model is, never whether it got an answer
+*right*. To ask "can a **compressed** model still **do** something", this repo
+now has a task layer (`tllm/tasks.py`, `eval.task_accuracy`) with three families:
+
+- **Algorithmic** (`copy`, `reverse`, `sort`) — verbatim recall and ordering.
+- **Long-range retrieval** (`kv` key→value lookup, `induction`) — fixed-length
+  sequences where the *position* of the queried fact is the dial. This is the
+  task the "Future work" below called for, and where KV-cache quantization can
+  finally be made to bite.
+- **Synthetic instruction following** (`multitask`) — one model, several digit
+  transforms selected by a leading instruction token; the warm-up for real SFT.
+
+```bash
+python -m scripts.train_task --task kv --n_pairs 32 --ckpt_dir ckpt_kv
+python -m scripts.run_task_ablation --ckpt_dir ckpt_kv   # accuracy-by-distance
+```
+
+`run_task_ablation.py` sweeps the **same** quant grid (weight INT8/INT4, KV
+INT8/INT4, combo) but reports **exact-match accuracy bucketed by retrieval
+distance** instead of perplexity by position — the accuracy analogue of the
+original per-position plot, and the honest way to test whether KV-INT4 develops
+a long-range tax once the task actually depends on distant context.
+
+For natural language there is an SFT path (`tllm/sft.py`, `scripts/prepare_sft.py`,
+`scripts/train_sft.py`, `scripts/chat.py`) that instruction-tunes the pretrained
+TinyStories checkpoint with response-only loss masking.
+
+### Tier 2: complex capabilities
+
+A second tier of tasks moves past single-step mappings into composition,
+generalization, and tool use — all still fixed-length, checkable, and runnable
+through the same `train_task` / `run_task_ablation` machinery:
+
+| task | capability it probes | smoke-test (CPU toy) |
+|---|---|---|
+| `addition` | multi-step arithmetic; LSB-first output = carry "scratchpad" | **solved** (0.96 at 1.2k iters) |
+| `incontext` | few-shot rule induction — infer an unseen per-sample map from k shots | **solved** (1.00) |
+| `tooluse`  | function calling: emit a call, executor runs it, consume the result | **solved** (1.00, called 1.00) |
+| `multihop` | compositional retrieval A→B→C (needs depth) | learning (~4× chance, under-trained) |
+| `statetrack` | stateful variable tracking; **recency** is the distance axis | learning (~3× chance, under-trained) |
+
+```bash
+python -m scripts.train_task --task incontext --ckpt_dir ckpt_icl
+python -m scripts.train_task --task tooluse   --ckpt_dir ckpt_tool
+python -m scripts.run_task_ablation --ckpt_dir ckpt_state   # recency-bucketed accuracy
+```
+
+Tool use closes the agentic loop in `eval.tool_use_accuracy`: greedy-decode until
+the model emits `CALL_END`, run `task.executor()` on the emitted call, splice the
+result back in, and continue — the injected tokens are masked out of the training
+loss (`Sample.answer_mask`) since the model is *given* them, not asked to predict
+them. The `multihop`/`statetrack` numbers are from tiny under-trained CPU models;
+task correctness and the pipeline are verified (each task ships an adversarial
+self-test), convergence is a GPU-budget question.
+
+The research payoff: running these through the quant grid asks a sharper question
+than the original study — *do complex capabilities (reasoning, in-context
+learning, tool use) degrade before simple ones (copy, single-hop lookup) under
+the same compression?* Complexity-as-a-fragility-axis, measured the same honest
+accuracy-by-distance way.
 
 ## Limitations & honesty
 
@@ -179,15 +252,36 @@ scripts/
   quantization is cheap *when long-range dependency is absent* — is a claim
   about this regime, not about frontier models. The methodology transfers; the
   numbers don't.
+- **KV-cache quant only acts during *cached generation*, not during a plain
+  forward pass.** The perplexity grid (`scripts/run_ablation.py`) scores with
+  `model.forward`, which never builds a KV cache, so `patch_kv_quant` has nothing
+  to wrap — KV-INT4 perplexity is therefore *identical* to the fp16 baseline by
+  construction (verified directly). The honest way to measure the KV axis is the
+  cached generation path, which the new `run_task_ablation.py` uses (its accuracy
+  numbers reflect KV quant; the old perplexity KV rows do not). Reconciling the
+  README's KV perplexity rows with this is on the to-do list.
+- **Prefill causality fix.** `Attention` previously set `is_causal = kv_cache
+  is None`, which made the generation *prefill* pass (`kv_cache=(None, None)`,
+  truthy) attend bidirectionally — corrupting the first generated token. Now
+  `is_causal = q_len > 1` (causal for training and prefill; a no-op for single-
+  token decode). This is required for exact-match tasks and also improves the
+  LM's own cached generation.
 
 ## Future work
 
 The clean follow-up is to re-run the same ablation on a task that *forces*
-long-range retrieval (e.g. a synthetic copy/lookup task, or a dataset with
-genuine document-level dependencies). The prediction above should hold *there*:
-KV-INT4 late-context perplexity should finally diverge from baseline. That
-experiment would turn "KV quantization is free here" into "here is exactly the
-context-utilization threshold where KV quantization starts to cost."
+long-range retrieval. **That scaffolding now exists** (`tasks.py` +
+`run_task_ablation.py`): train the `kv` lookup or `induction` model, then sweep
+the quant grid and read accuracy-by-distance. The prediction above should hold
+*there*: KV-INT4 accuracy should fall off at large retrieval distances while
+weight-INT4 degrades roughly uniformly — turning "KV quantization is free here"
+into "here is exactly the context-utilization threshold where it starts to cost."
+
+Open threads: (1) run the long-range grid to convergence on GPU and add the
+accuracy-by-distance figure; (2) reconcile the README's KV *perplexity* rows
+with the no-op caveat above (measure KV quant via a cached/sequential forward);
+(3) the `multitask` → real-SFT bridge, and a dense-vs-MoE pass (the MoE FFN in
+`model.py` is implemented but never ablated).
 
 ## License
 
