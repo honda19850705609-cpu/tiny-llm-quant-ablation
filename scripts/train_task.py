@@ -48,7 +48,32 @@ def build_task_from_args(args):
         return T.InductionTask(seq_len=args.seq_len, n_symbols=args.n_symbols)
     if args.task == "multitask":
         return T.MultiTask(seq_len=args.seq_len, n_symbols=args.n_symbols)
+    # --- Tier 2 ---
+    if args.task == "addition":
+        return T.AdditionTask(n_digits=args.n_digits)
+    if args.task == "incontext":
+        return T.InContextMappingTask(n_symbols=args.n_symbols, n_shots=args.n_shots,
+                                      mode=args.mode)
+    if args.task == "multihop":
+        return T.MultiHopTask(n_pairs=args.n_pairs, hops=args.hops, n_symbols=args.n_symbols)
+    if args.task == "statetrack":
+        return T.StateTrackingTask(n_vars=args.n_vars, n_ops=args.n_ops, n_vals=args.n_vals)
+    if args.task == "tooluse":
+        return T.ToolUseTask(n_digits=args.n_digits)
     raise ValueError(args.task)
+
+
+def is_tool_task(task):
+    return getattr(task, "name", None) == "tooluse"
+
+
+def eval_task(model, task, device, n_samples):
+    """Accuracy for the task, using the agentic loop for tool tasks."""
+    if is_tool_task(task):
+        acc, called, n = E.tool_use_accuracy(model, task, device, n_samples=n_samples)
+        return acc, n, f"acc {acc:.3f} | tool-called {called:.2f}"
+    acc, n = E.task_accuracy(model, task, device, n_samples=n_samples)
+    return acc, n, f"acc {acc:.3f}"
 
 
 def lr_lambda(it, warmup, max_iters, min_ratio=0.1):
@@ -63,7 +88,8 @@ def lr_lambda(it, warmup, max_iters, min_ratio=0.1):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", required=True,
-                    choices=["copy", "reverse", "sort", "kv", "induction", "multitask"])
+                    choices=["copy", "reverse", "sort", "kv", "induction", "multitask",
+                             "addition", "incontext", "multihop", "statetrack", "tooluse"])
     ap.add_argument("--ckpt_dir", default="ckpt_task")
     ap.add_argument("--max_iters", type=int, default=8000)
     ap.add_argument("--batch_size", type=int, default=64)
@@ -78,6 +104,14 @@ def main():
     ap.add_argument("--n_pairs", type=int, default=32)
     ap.add_argument("--n_keys", type=int, default=64)
     ap.add_argument("--n_vals", type=int, default=16)
+    # Tier 2 task knobs
+    ap.add_argument("--n_digits", type=int, default=3, help="addition / tooluse")
+    ap.add_argument("--n_shots", type=int, default=4, help="incontext")
+    ap.add_argument("--mode", default="shift", choices=["shift", "permutation"],
+                    help="incontext: shift=generalize to unseen query, permutation=recall")
+    ap.add_argument("--hops", type=int, default=3, help="multihop")
+    ap.add_argument("--n_vars", type=int, default=8, help="statetrack")
+    ap.add_argument("--n_ops", type=int, default=12, help="statetrack")
     # model knobs (smaller than the LM by default — these tasks are easy)
     ap.add_argument("--n_layer", type=int, default=4)
     ap.add_argument("--n_head", type=int, default=8)
@@ -92,7 +126,11 @@ def main():
     torch.manual_seed(args.seed)
 
     task = build_task_from_args(args)
-    block_size = args.block_size or task.total_len
+    # Tool tasks decode in an interactive loop that can wander a few tokens past
+    # the canonical length before emitting EOS; give the RoPE cache headroom so
+    # eval-time generation isn't truncated. (Training still only uses total_len.)
+    headroom = 8 if is_tool_task(task) else 0
+    block_size = args.block_size or (task.total_len + headroom)
     assert block_size >= task.total_len, \
         f"block_size {block_size} < task total_len {task.total_len}"
     print(f"task={args.task} vocab={task.vocab_size} total_len={task.total_len} "
@@ -130,17 +168,22 @@ def main():
         opt.step()
 
         if it % args.eval_interval == 0:
-            acc, n = E.task_accuracy(model, task, device, n_samples=256, batch_size=64)
+            # the tool loop decodes per-sample (slower, esp. before the model
+            # learns to emit EOS), so evaluate on fewer samples for tool tasks.
+            n_eval = 128 if is_tool_task(task) else 256
+            acc, n, msg = eval_task(model, task, device, n_samples=n_eval)
             model.train()
             dt = time.time() - t0
-            print(f"iter {it:6d} | loss {loss.item():.4f} | acc {acc:.3f} (n={n}) | {dt:.1f}s")
+            print(f"iter {it:6d} | loss {loss.item():.4f} | {msg} (n={n}) | {dt:.1f}s",
+                  flush=True)
 
         if it % args.ckpt_interval == 0 and it > 0:
             save(it)
 
     save(args.max_iters - 1)
-    acc, n = E.task_accuracy(model, task, device, n_samples=1024, batch_size=64)
-    print(f"training done. final acc {acc:.3f} (n={n}). saved {ckpt_path}")
+    n_final = 512 if is_tool_task(task) else 1024
+    acc, n, msg = eval_task(model, task, device, n_samples=n_final)
+    print(f"training done. final {msg} (n={n}). saved {ckpt_path}", flush=True)
 
 
 if __name__ == "__main__":

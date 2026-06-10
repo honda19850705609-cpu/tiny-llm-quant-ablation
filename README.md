@@ -159,8 +159,9 @@ tllm/
   quant.py     # weight + KV-cache quantization
   eval.py      # perplexity, per-position perplexity, latency/memory,
                #   task accuracy, accuracy-by-distance   (new)
-  tasks.py     # synthetic task framework: copy/reverse/sort/kv/induction/
-               #   multitask, with checkable answers     (new)
+  tasks.py     # synthetic task framework, checkable answers          (new)
+               #   tier 1: copy/reverse/sort/kv/induction/multitask
+               #   tier 2: addition/incontext/multihop/statetrack/tooluse
   sft.py       # instruction chat-template + response-only loss mask  (new)
 scripts/
   prepare_data.py      # TinyStories -> tokenizer -> memmap
@@ -201,6 +202,40 @@ a long-range tax once the task actually depends on distant context.
 For natural language there is an SFT path (`tllm/sft.py`, `scripts/prepare_sft.py`,
 `scripts/train_sft.py`, `scripts/chat.py`) that instruction-tunes the pretrained
 TinyStories checkpoint with response-only loss masking.
+
+### Tier 2: complex capabilities
+
+A second tier of tasks moves past single-step mappings into composition,
+generalization, and tool use — all still fixed-length, checkable, and runnable
+through the same `train_task` / `run_task_ablation` machinery:
+
+| task | capability it probes | smoke-test (CPU toy) |
+|---|---|---|
+| `addition` | multi-step arithmetic; LSB-first output = carry "scratchpad" | **solved** (0.96 at 1.2k iters) |
+| `incontext` | few-shot rule induction — infer an unseen per-sample map from k shots | **solved** (1.00) |
+| `tooluse`  | function calling: emit a call, executor runs it, consume the result | **solved** (1.00, called 1.00) |
+| `multihop` | compositional retrieval A→B→C (needs depth) | learning (~4× chance, under-trained) |
+| `statetrack` | stateful variable tracking; **recency** is the distance axis | learning (~3× chance, under-trained) |
+
+```bash
+python -m scripts.train_task --task incontext --ckpt_dir ckpt_icl
+python -m scripts.train_task --task tooluse   --ckpt_dir ckpt_tool
+python -m scripts.run_task_ablation --ckpt_dir ckpt_state   # recency-bucketed accuracy
+```
+
+Tool use closes the agentic loop in `eval.tool_use_accuracy`: greedy-decode until
+the model emits `CALL_END`, run `task.executor()` on the emitted call, splice the
+result back in, and continue — the injected tokens are masked out of the training
+loss (`Sample.answer_mask`) since the model is *given* them, not asked to predict
+them. The `multihop`/`statetrack` numbers are from tiny under-trained CPU models;
+task correctness and the pipeline are verified (each task ships an adversarial
+self-test), convergence is a GPU-budget question.
+
+The research payoff: running these through the quant grid asks a sharper question
+than the original study — *do complex capabilities (reasoning, in-context
+learning, tool use) degrade before simple ones (copy, single-hop lookup) under
+the same compression?* Complexity-as-a-fragility-axis, measured the same honest
+accuracy-by-distance way.
 
 ## Limitations & honesty
 

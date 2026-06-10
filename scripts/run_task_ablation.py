@@ -54,12 +54,18 @@ def fresh(state, cfg, device):
 
 
 def default_distances(task):
-    if hasattr(task, "n_pairs"):
+    # name-based on purpose: several tasks share an n_pairs attribute, so a
+    # hasattr check would misroute them. Only tasks accuracy_by_distance knows
+    # how to pin get a distance axis.
+    if task.name == "kv":
         n = task.n_pairs
         return sorted(set(int(d) for d in np.linspace(0, n - 1, min(n, 8))))
     if task.name == "induction":
         L = task.seq_len
         return sorted(set(int(d) for d in np.linspace(2, L - 1, 8)))
+    if task.name == "statetrack":
+        n = task.n_ops
+        return sorted(set(int(d) for d in np.linspace(1, n, min(n, 8))))
     return None   # task has no retrieval-distance axis -> accuracy only
 
 
@@ -77,18 +83,25 @@ def main():
     distances = default_distances(task)
     print(f"task={task.name} distances={distances}")
 
+    is_tool = getattr(task, "name", None) == "tooluse"
+
     def evaluate(model, kv_cfg=None):
         unpatch = None
         if kv_cfg is not None and kv_cfg.enabled:
             unpatch = patch_kv_quant(model, kv_cfg)
-        acc, n = E.task_accuracy(model, task, device, n_samples=args.n_samples)
-        by_dist = []
-        if distances is not None:
-            by_dist = E.accuracy_by_distance(model, task, device, distances,
-                                             n_per_dist=args.n_per_dist)
+        if is_tool:
+            acc, called, n = E.tool_use_accuracy(model, task, device, n_samples=args.n_samples)
+            out = {"acc": acc, "tool_called": called, "n": n, "acc_by_distance": []}
+        else:
+            acc, n = E.task_accuracy(model, task, device, n_samples=args.n_samples)
+            by_dist = []
+            if distances is not None:
+                by_dist = E.accuracy_by_distance(model, task, device, distances,
+                                                 n_per_dist=args.n_per_dist)
+            out = {"acc": acc, "n": n, "acc_by_distance": by_dist}
         if unpatch:
             unpatch()
-        return {"acc": acc, "n": n, "acc_by_distance": by_dist}
+        return out
 
     results = {}
 
