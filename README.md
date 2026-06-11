@@ -26,6 +26,13 @@ used in the first place.
 KV quantization depends on how a task actually uses its context — not on the
 compression itself.**
 
+> **Follow-up (task-completion regime):** extending the testbed from perplexity
+> to *checkable tasks* sharpens this into a rule —
+> [**quantization cost tracks the capability margin, not the capability**](#finding-quantization-cost-tracks-the-capability-margin-not-the-capability).
+> Reasoning, in-context learning, and tool use are all lossless under INT4 *until*
+> the task reaches the model's edge, where weight-INT4 collapses ~18 pts and
+> KV-INT4 ~7 pts while INT8 stays free.
+
 | config | perplexity | size (MB) | note |
 |---|---|---|---|
 | fp16 baseline | 4.367 | 55.6 | reference |
@@ -237,6 +244,44 @@ learning, tool use) degrade before simple ones (copy, single-hop lookup) under
 the same compression?* Complexity-as-a-fragility-axis, measured the same honest
 accuracy-by-distance way.
 
+## Finding: quantization cost tracks the *capability margin*, not the capability
+
+Running the quant grid on the Tier-2 tasks produced a sharper result than "which
+capability is fragile." Multi-step arithmetic, in-context learning, and tool use
+are **all perfectly robust to INT4 — until the task reaches the edge of what the
+model can do.**
+
+The clean probe is addition with a difficulty dial (`--n_digits`). Train each to
+its budget, then sweep the same quant grid:
+
+![quantization cost at the margin](result/margin_curve.png)
+
+| n_digits | fp16 | w-INT8 | w-INT4 (g128) | w-INT4 (g64) | KV-INT8 | KV-INT4 |
+|---|---|---|---|---|---|---|
+| 4 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 5 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 6 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| **7** | **0.963** | 0.961 | **0.781** | **0.762** | 0.963 | **0.896** |
+| 8 | 0.082 | — model never learns the task at this budget (noise floor) — |
+
+At `n_digits ≤ 6` the model solves addition with a comfortable margin and **every
+configuration, INT4 included, is exactly lossless.** At `n_digits = 7`, where fp16
+itself is just off perfect (0.963), the picture splits hard: **INT8 stays free,
+weight-INT4 collapses ~18–20 points (to ~0.77), and KV-INT4 drops ~7 points (to
+0.90).** The gaps are far larger than sampling noise (n=512, >5σ). At `n_digits =
+8` the model never learns the task, so there is no margin to tax and the numbers
+are an uninformative floor.
+
+**The takeaway:** quantization's cost is governed by how close the model runs to
+its capability margin, not by whether the capability is "simple" or "complex." A
+task solved with slack is robust even to INT4; the same compression bites exactly
+at the difficulty where the model is already near its limit — and weight-INT4
+bites harder than KV-INT4, with INT8 safe throughout. This is the same mechanism
+behind the original "KV-INT4 is free on TinyStories" result (ample margin), now
+isolated with a difficulty knob instead of inferred. It also explains why the
+`kv` long-range task resisted training: that task sits *at* the model's edge,
+which is precisely the regime where compression — and learning — are hardest.
+
 ## Limitations & honesty
 
 - Weight quantization is **simulated** (quant→dequant in fp). This measures the
@@ -266,6 +311,13 @@ accuracy-by-distance way.
   `is_causal = q_len > 1` (causal for training and prefill; a no-op for single-
   token decode). This is required for exact-match tasks and also improves the
   LM's own cached generation.
+- **The margin sweep is single-seed at a fixed training budget.** "Margin" here
+  conflates intrinsic task difficulty with how much the model was trained, so
+  `n_digits=7` being the knee is specific to this model size and 8k-step budget,
+  not a universal threshold. The *shape* (lossless inside the margin, INT4 bites
+  at the edge, weight-INT4 > KV-INT4 > INT8) is the claim; the exact knee is not.
+  Multi-seed runs and training d=7 to fp16=1.0 (to separate under-training from
+  capacity) would harden it.
 
 ## Future work
 
