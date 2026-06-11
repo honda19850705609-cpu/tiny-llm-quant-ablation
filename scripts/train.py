@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--n_kv_head", type=int, default=4)
     ap.add_argument("--n_embd", type=int, default=512)
     ap.add_argument("--block_size", type=int, default=512)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model (big A100 throughput win)")
     args = ap.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -98,6 +100,11 @@ def main():
             vocab_size = len(json.load(f)["model"]["vocab"])
     print("vocab_size:", vocab_size)
 
+    # A100 throughput: enable TF32 matmuls (free ~1.3-1.7x on the fp32 paths)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     cfg = ModelConfig(
         vocab_size=vocab_size, n_layer=args.n_layer, n_head=args.n_head,
         n_kv_head=args.n_kv_head, n_embd=args.n_embd, block_size=args.block_size,
@@ -106,7 +113,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
 
-    # ---- resume ----
+    # ---- resume (load into the uncompiled model -> clean state_dict keys) ----
     start_iter = 0
     ckpt_path = os.path.join(args.ckpt_dir, "ckpt.pt")
     if os.path.exists(ckpt_path):
@@ -117,8 +124,14 @@ def main():
         start_iter = ck["iter"] + 1
         print("resumed at iter", start_iter)
 
+    raw_model = model                       # handle for clean save/state_dict
+    if args.compile:
+        print("compiling model with torch.compile (first step is slow) ...")
+        model = torch.compile(model)
+
     model.train()
-    t0 = time.time()
+    t0 = time.time(); t_last = t0
+    tok_per_step = args.batch_size * args.grad_accum * args.block_size
     for it in range(start_iter, args.max_iters):
         for g in opt.param_groups:
             g["lr"] = args.lr * lr_lambda(it, args.warmup, args.max_iters)
@@ -137,18 +150,22 @@ def main():
 
         if it % args.eval_interval == 0:
             vl = estimate_loss(model, val_data, args.block_size, args.batch_size, device)
-            dt = time.time() - t0
-            print(f"iter {it:6d} | val loss {vl:.4f} | ppl {math.exp(vl):.2f} | {dt:.1f}s")
+            now = time.time()
+            n_steps = args.eval_interval if it > start_iter else 1
+            tps = tok_per_step * n_steps / max(now - t_last, 1e-9)
+            print(f"iter {it:6d} | val loss {vl:.4f} | ppl {math.exp(vl):.2f} | "
+                  f"{now - t0:.1f}s | {tps/1e3:.0f}k tok/s")
+            t_last = now
 
         if it % args.ckpt_interval == 0 and it > start_iter:
             torch.save({
-                "model": model.state_dict(), "opt": opt.state_dict(),
+                "model": raw_model.state_dict(), "opt": opt.state_dict(),
                 "iter": it, "cfg": cfg.__dict__,
             }, ckpt_path)
 
     # final save
     torch.save({
-        "model": model.state_dict(), "opt": opt.state_dict(),
+        "model": raw_model.state_dict(), "opt": opt.state_dict(),
         "iter": args.max_iters - 1, "cfg": cfg.__dict__,
     }, ckpt_path)
     print("training done. saved", ckpt_path)
